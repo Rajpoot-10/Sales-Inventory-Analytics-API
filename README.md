@@ -120,3 +120,40 @@ in `.streamlit/config.toml`.
 
 Keep your Supabase project active and configure its Project URL and secret key
 in the local `.env` file. Never commit this file.
+
+## Streamlit Community Cloud
+
+Deploy `dashboard.py` from the `main` branch. The root `requirements.txt`
+contains only the packages used by this project and excludes Windows-only tools.
+
+The dashboard and FastAPI are separate processes. Community Cloud starts the
+Streamlit dashboard; it does not start `uvicorn main:app` automatically. Deploy
+the backend separately, then add this setting in the Streamlit app's Secrets:
+
+```toml
+API_URL = "https://your-deployed-api.example.com"
+```
+
+Replace the example with your actual backend URL. Configure `SUPABASE_URL` and
+`SUPABASE_SECRET_KEY` in the backend host's environment. A localhost API address
+cannot connect from Community Cloud to your personal computer.
+
+For local secrets, `.streamlit/secrets.toml` is ignored by Git. Never commit keys.
+
+### Standalone cloud mode (no separate API hosting)
+
+In the Streamlit app's Secrets settings, add:
+
+```toml
+DATA_BACKEND = "supabase"
+SUPABASE_URL = "https://your-project.supabase.co"
+SUPABASE_SECRET_KEY = "your-project-secret-key"
+```
+
+Use your real credentials only in Secrets, never in GitHub or chat. This mode
+reuses the existing read-only analytics functions directly without an HTTP
+server. Local use defaults to API mode; set `DATA_BACKEND = "api"` and `API_URL`
+if you prefer a separately hosted backend. Restart after changing credentials.
+
+Anyone who can access the dashboard can view the displayed business data.
+Restrict app access if the data should remain private.

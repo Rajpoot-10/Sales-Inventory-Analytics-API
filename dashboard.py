@@ -1,4 +1,4 @@
-﻿"""Nexus: a Streamlit workspace for sales and inventory intelligence."""
+"""Nexus: a Streamlit workspace for sales and inventory intelligence."""
 import os
 from datetime import datetime
 from html import escape
@@ -10,7 +10,18 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="Nexus / Commerce intelligence", page_icon="◈", layout="wide")
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+def setting(name, default=None):
+    value = os.getenv(name)
+    if value is not None:
+        return value
+    try:
+        return st.secrets.get(name, default)
+    except FileNotFoundError:
+        return default
+
+
+API_URL = setting("API_URL", "http://127.0.0.1:8000").strip().rstrip("/")
+DATA_BACKEND = setting("DATA_BACKEND", "api").strip().lower()
 COLORS = ["#526c39", "#bbd77a", "#252d28", "#dfad65", "#929e8a", "#c9c6b8"]
 
 st.markdown("""
@@ -86,7 +97,49 @@ def empty(title, message):
     html(f'<div class="empty"><b>{escape(title)}</b><p>{escape(message)}</p></div>')
 
 
+def fetch_supabase(endpoint):
+    """Reuse read-only API analytics without starting an HTTP server."""
+    from urllib.parse import parse_qs, urlsplit
+    import httpx
+    from fastapi import HTTPException
+    from postgrest.exceptions import APIError
+
+    for name in ("SUPABASE_URL", "SUPABASE_SECRET_KEY"):
+        value = setting(name)
+        if not value:
+            st.error(f"Add {name} to your Streamlit app Secrets to connect your database.")
+            return None
+        os.environ[name] = value
+    try:
+        import main as analytics
+        url = urlsplit(endpoint)
+        params = parse_qs(url.query)
+        if url.path == "/products":
+            return analytics.get_products()
+        if url.path == "/analytics/stock-alerts":
+            return analytics.get_stock_alerts()
+        if url.path == "/analytics/top-products":
+            return analytics.get_top_products(limit=None)
+        if url.path == "/analytics/revenue":
+            return analytics.get_revenue_analytics(period=params.get("period", ["daily"])[0])
+        if url.path == "/analytics/forecast":
+            return analytics.get_demand_forecast(window_days=int(params.get("window_days", ["7"])[0]))
+        st.error("This data view is not available in standalone mode.")
+    except httpx.RequestError:
+        st.error("Cannot reach Supabase. Check the Project URL and confirm the project is active.")
+    except APIError:
+        st.error("Supabase rejected the request. Check your key, tables, and database permissions.")
+    except (HTTPException, ValueError):
+        st.error("Unable to load analytics. Check the database configuration and table data.")
+    return None
+
+
 def fetch_api(endpoint):
+    if DATA_BACKEND == "supabase":
+        return fetch_supabase(endpoint)
+    if DATA_BACKEND != "api":
+        st.error("DATA_BACKEND must be 'api' or 'supabase'.")
+        return None
     try:
         response = requests.get(f"{API_URL}{endpoint}", timeout=(3, 20))
         response.raise_for_status()
@@ -94,7 +147,7 @@ def fetch_api(endpoint):
     except requests.Timeout:
         st.error("Your data is taking longer than expected. Try refreshing in a moment.")
     except requests.ConnectionError:
-        st.error("Unable to reach your API. Start it with: python -m uvicorn main:app --reload")
+        st.error("Unable to reach the API. Locally, run: python -m uvicorn main:app --reload. On Streamlit Cloud, set API_URL in app Secrets to your deployed FastAPI HTTPS address; localhost cannot reach your PC.")
     except requests.HTTPError:
         st.error(f"Data is unavailable (HTTP {response.status_code}). Check the API and Supabase connection, then refresh.")
     except (requests.RequestException, ValueError):
