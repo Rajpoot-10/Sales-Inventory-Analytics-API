@@ -1,14 +1,19 @@
 import os
+from pathlib import Path
+from urllib.parse import urlparse
+import httpx
+from postgrest.exceptions import APIError
+from fastapi.responses import JSONResponse
 from typing import Optional
 import numpy as np
 import pandas as pd
 from typing import List
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-load_dotenv()
+load_dotenv(Path(__file__).with_name(".env"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
@@ -16,12 +21,32 @@ SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
     raise ValueError("Missing Supabase credentials in environment variables.")
 
+parsed_url = urlparse(SUPABASE_URL)
+if parsed_url.scheme not in {"https", "http"} or not parsed_url.hostname:
+    raise ValueError("SUPABASE_URL must be a valid HTTP(S) project URL.")
+
 supabase: Client = create_client(
     SUPABASE_URL,
     SUPABASE_SECRET_KEY
 )
 
 app = FastAPI(title="Sales & Inventory Analytics API")
+
+
+@app.exception_handler(httpx.RequestError)
+async def database_connection_error(request, exc):
+    return JSONResponse(status_code=503, content={"detail": (
+        "Cannot connect to Supabase. Check SUPABASE_URL in .env, confirm the "
+        "project is active, and check DNS/network connectivity."
+    )})
+
+
+@app.exception_handler(APIError)
+async def database_api_error(request, exc):
+    return JSONResponse(status_code=502, content={"detail": (
+        "Supabase rejected the database request. Check the project key, "
+        "table schema, and database permissions."
+    )})
 
 
 # --- Pydantic Schemas ---
@@ -108,6 +133,9 @@ def update_product_partial(product_id: int, product: ProductUpdate):
     # Exclude unset fields so omitted attributes aren't overwritten with None
     update_data = product.model_dump(exclude_unset=True)
 
+    if any(value is None for value in update_data.values()):
+        raise HTTPException(status_code=422, detail="Product fields cannot be null")
+
     if not update_data:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -152,7 +180,7 @@ class OrderItemCreate(BaseModel):
 
 
 class OrderCreate(BaseModel):
-    items: List[OrderItemCreate]
+    items: List[OrderItemCreate] = Field(min_length=1)
 
 
 # --- Order Endpoints ---
@@ -162,8 +190,14 @@ def create_order(order: OrderCreate):
     total_order_value = 0.0
     items_to_process = []
 
-    # Step 1: Validate stock for all requested items
+    # Combine repeated products before checking or decrementing stock.
+    quantities = {}
     for item in order.items:
+        quantities[item.product_id] = quantities.get(item.product_id, 0) + item.quantity
+
+    # Step 1: Validate stock for all requested items
+    for product_id, quantity in quantities.items():
+        item = OrderItemCreate(product_id=product_id, quantity=quantity)
         prod_resp = supabase.table("products").select(
             "*").eq("id", item.product_id).execute()
 
@@ -223,12 +257,6 @@ def create_order(order: OrderCreate):
 
 
 # orders get orders endpoints
-
-
-@app.get("/orders")
-def get_orders_all():
-    response = supabase.table("orders").select("*").execute()
-    return response.data
 
 
 @app.get("/orders")
@@ -320,7 +348,7 @@ def get_stock_alerts():
 
 # --- Multi-Table Analytics Endpoint (Pandas pd.merge) ---
 @app.get("/analytics/top-products")
-def get_top_products():
+def get_top_products(limit: Optional[int] = Query(default=None, ge=1, le=100)):
     try:
         # 1. Fetch data from Supabase
         prod_resp = supabase.table("products").select("*").execute()
@@ -341,7 +369,7 @@ def get_top_products():
             df_products["total_revenue"] = 0.0
             result = df_products[["id", "name", "category",
                                   "total_units_sold", "total_revenue"]]
-            return {"top_products": result.to_dict(orient="records")}
+            return {"top_products": result.head(limit if limit is not None else len(result)).to_dict(orient="records")}
 
         # 2. Determine price column and line revenue
         price_col = "unit_price" if "unit_price" in df_items.columns else "price"
@@ -356,7 +384,7 @@ def get_top_products():
             df_items,
             left_on="product_id_pk",
             right_on="product_id",
-            how="inner"
+            how="left"
         )
 
         # 5. Fill unpurchased product rows with zeros
@@ -383,8 +411,10 @@ def get_top_products():
         df_sorted = df_grouped.sort_values(
             by="total_revenue", ascending=False)
 
-        return {"top_products": df_sorted.to_dict(orient="records")}
+        return {"top_products": df_sorted.head(limit if limit is not None else len(df_sorted)).to_dict(orient="records")}
 
+    except (httpx.RequestError, APIError):
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -423,7 +453,7 @@ def get_revenue_analytics(period: str = "daily"):
         df_orders = pd.DataFrame(orders_data)
 
         # Convert created_at column to pandas datetime objects
-        df_orders["created_at"] = pd.to_datetime(df_orders["created_at"])
+        df_orders["created_at"] = pd.to_datetime(df_orders["created_at"], format="mixed", utc=True)
         
         # Ensure total_value is float
         df_orders["total_value"] = df_orders["total_value"].astype(float)
@@ -463,6 +493,8 @@ def get_revenue_analytics(period: str = "daily"):
             "revenue_data": df_result.to_dict(orient="records")
         }
 
+    except (httpx.RequestError, APIError):
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -503,22 +535,24 @@ def get_demand_forecast(window_days: int = 7):
 
         if not items_data:
             # If no orders exist, forecast 0 units for all products
-            df_products["predicted_daily_demand"] = 0.0
+            df_products = df_products.rename(columns={"id": "product_id", "stock": "current_stock"})
+            df_products["avg_daily_demand"] = 0.0
             df_products["predicted_period_demand"] = 0.0
-            result = df_products[["id", "name", "category", "stock", "predicted_daily_demand", "predicted_period_demand"]]
+            df_products["reorder_suggested"] = False
+            result = df_products[["product_id", "name", "category", "current_stock", "avg_daily_demand", "predicted_period_demand", "reorder_suggested"]]
             return {"forecast_window_days": window_days, "forecasts": result.to_dict(orient="records")}
 
         df_items = pd.DataFrame(items_data)
 
         # 2. Parse timestamps and sort by date
-        df_items["created_at"] = pd.to_datetime(df_items["created_at"])
+        df_items["created_at"] = pd.to_datetime(df_items["created_at"], format="mixed", utc=True)
         
         # Determine analysis date range
         max_date = df_items["created_at"].max()
         start_date = max_date - pd.Timedelta(days=window_days)
 
         # 3. Filter orders within the selected rolling window
-        df_window = df_items[df_items["created_at"] >= start_date]
+        df_window = df_items[df_items["created_at"] > start_date]
 
         forecasts = []
 
@@ -556,6 +590,8 @@ def get_demand_forecast(window_days: int = 7):
             "forecasts": forecasts
         }
 
+    except (httpx.RequestError, APIError):
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

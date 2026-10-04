@@ -101,3 +101,22 @@ FastAPI automatically generates interactive documentation. Once the app is runni
 Swagger UI: http://127.0.0.1:8000/docs
 
 ReDoc: http://127.0.0.1:8000/redoc
+
+## Streamlit dashboard
+
+The Nexus dashboard provides an overview of revenue and inventory, product search
+and category filters, revenue trends, demand forecasts, and CSV exports.
+
+Start the API and dashboard in separate terminals:
+
+```powershell
+python -m uvicorn main:app --reload
+python -m streamlit run dashboard.py
+```
+
+The dashboard connects to `http://127.0.0.1:8000` by default. Set the `API_URL`
+environment variable to use another API address. The dashboard theme is configured
+in `.streamlit/config.toml`.
+
+Keep your Supabase project active and configure its Project URL and secret key
+in the local `.env` file. Never commit this file.
